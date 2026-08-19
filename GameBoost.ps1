@@ -1,448 +1,1166 @@
-#Requires -RunAsAdministrator
-# GameBoost - process priorities, audio, Windows optimizations
-# Launched from GameBoost.bat
+﻿#Requires -RunAsAdministrator
+<#
+    GameBoost v1.1 fix2
+    - Своё консольное окно (крестик = в трей)
+    - Самодиагностика при старте
+    - Трей не может уронить запуск
+    - Heroic авто-буст, Ctrl+Alt+B, автозапуск через планировщик
+    - БЕЗ авто-починки звука
+#>
 
-$ErrorActionPreference = "SilentlyContinue"
-$script:Config = $null
-$script:LogPath = $null
+param(
+    [switch]$Hidden
+)
 
-function Get-ScriptDir {
-    Split-Path -Parent $MyInvocation.ScriptName
+#region === БАЗА ===
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
+
+$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ConfigPath = Join-Path $ScriptDir 'GameBoost_config.ini'
+
+$script:LogPath          = Join-Path $ScriptDir 'GameBoost_log.txt'
+$script:Config           = $null
+$script:Paused           = $false
+$script:ExitRequested    = $false
+$script:AllowClose       = $false
+$script:Form             = $null
+$script:Rtb              = $null
+$script:Tray             = $null
+$script:Hotkey           = $null
+$script:MenuPause        = $null
+$script:MenuHeroic       = $null
+$script:MenuStartup      = $null
+$script:LastProcessCheck = [datetime]::MinValue
+$script:LastOptCheck     = [datetime]::MinValue
+
+$mutex = New-Object System.Threading.Mutex($false, 'Global\GameBoost_v11fix2')
+if (-not $mutex.WaitOne(0, $false)) {
+    [System.Windows.Forms.MessageBox]::Show(
+        'GameBoost уже запущен. Закрой его через трей: ПКМ -> Выход.',
+        'GameBoost'
+    )
+    exit
 }
 
-$ScriptDir = Get-ScriptDir
-$ConfigPath = Join-Path $ScriptDir "GameBoost_config.ini"
+#endregion
+
+#region === NATIVE (C#) ===
+
+try {
+    if (-not ('User32Foreground' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class User32Foreground {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}
+'@
+    }
+} catch {}
+
+try {
+    if (-not ('NtTimer' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class NtTimer {
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetTimerResolution(uint DesiredResolution, bool SetResolution, out uint CurrentResolution);
+}
+'@
+    }
+} catch {}
+
+try {
+    if (-not ('MemTrim' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class MemTrim {
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+    [DllImport("psapi.dll")]    public static extern bool EmptyWorkingSet(IntPtr h);
+    public static bool Trim(int pid) {
+        IntPtr h = OpenProcess(0x0400 | 0x0100, false, pid);
+        if (h == IntPtr.Zero) return false;
+        bool ok = EmptyWorkingSet(h);
+        CloseHandle(h);
+        return ok;
+    }
+}
+'@
+    }
+} catch {}
+
+try {
+    if (-not ('GbHotkey' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+public class GbHotkey : NativeWindow {
+    [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    public const int WM_HOTKEY = 0x0312;
+    public static int HotkeyCount = 0;
+    public void Setup() {
+        CreateHandle(new CreateParams());
+        RegisterHotKey(Handle, 1, 0x0002 | 0x0004, 0x42);
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == WM_HOTKEY) Interlocked.Increment(ref HotkeyCount);
+        base.WndProc(ref m);
+    }
+}
+'@ -ReferencedAssemblies 'System.Windows.Forms'
+    }
+} catch {}
+
+#endregion
+
+#region === УТИЛИТЫ ===
+
+function ConvertTo-Bool {
+    param([string]$Value, [bool]$Default = $false)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Default }
+    $v = $Value.Trim().ToLower()
+    if (@('1', 'true', 'yes', 'on', 'enabled') -contains $v) { return $true }
+    if (@('0', 'false', 'no', 'off', 'disabled') -contains $v) { return $false }
+    return $Default
+}
 
 function Write-Log {
-    param([string]$Msg, [string]$Level = "INFO")
-    if (-not $script:Config -or $script:Config.EnableLog -ne "1") { return }
-    $path = $script:LogPath
-    if ([string]::IsNullOrWhiteSpace($path)) { $path = Join-Path $ScriptDir "GameBoost_log.txt" }
-    $line = "{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}" -f (Get-Date), $Level, $Msg
-    Add-Content -LiteralPath $path -Value $line -ErrorAction SilentlyContinue
+    param([string]$Message, [string]$Level = 'INFO')
+    if (-not $script:Config -or -not $script:Config.EnableLog) { return }
+    $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f (Get-Date), $Level, $Message
+    Add-Content -LiteralPath $script:LogPath -Value $line -ErrorAction SilentlyContinue
 }
 
-function Read-Config {
-    $config = @{
-        LowPriority = @("Discord", "DiscordPTB", "DiscordCanary", "chrome")
-        HighPriority = @("Rocket League", "RocketLeague", "csgo", "cs2", "Valorant", "dota 2", "dota2", "FortniteClient-Win64", "GTA5", "Overwatch", "apex", "League of Legends", "Wow", "Wow-64", "Destiny2", "Warframe")
-        ProcessCheckInterval = 3
-        AudioCheckInterval = 5
-        OptimizationCheckInterval = 5
-        FixAudio = "1"
-        RestartAudioService = "1"
-        RestartAudioEndpoint = "1"
-        ApplyOptimizations = "1"
-        HighPerformancePower = "1"
-        GameMode = "1"
-        DisableNagle = "1"
-        TimerResolution = "1"
-        BackgroundServices = "0"
-        NetworkThrottling = "1"
-        HardwareAccelGPU = "1"
-        DisableIndexing = "0"
-        EnableLog = "0"
-        LogPath = ""
-    }
-    if (-not (Test-Path $ConfigPath)) { return $config }
-    $content = Get-Content $ConfigPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-    if (-not $content) { return $config }
-    foreach ($line in ($content -split "`r?`n")) {
-        $line = $line.Trim()
-        if ($line -match '^\[(.+)\]') { continue }
-        if ($line -match '^([^;#=]+)=(.*)$') {
-            $key = $matches[1].Trim()
-            $val = $matches[2].Trim()
-            switch ($key) {
-                "LowPriority"  { $config.LowPriority = ($val -split ',').Trim() | Where-Object { $_ } }
-                "HighPriority"  { $config.HighPriority = ($val -split ',').Trim() | Where-Object { $_ } }
-                "ProcessCheckInterval" {
-                    $parsed = 0
-                    if ([int]::TryParse($val, [ref]$parsed)) { $config.ProcessCheckInterval = $parsed }
-                    else { $config.ProcessCheckInterval = 3 }
-                }
-                "AudioCheckInterval" {
-                    $parsed = 0
-                    if ([int]::TryParse($val, [ref]$parsed)) { $config.AudioCheckInterval = $parsed }
-                    else { $config.AudioCheckInterval = 5 }
-                }
-                "OptimizationCheckInterval" {
-                    $parsed = 0
-                    if ([int]::TryParse($val, [ref]$parsed)) { $config.OptimizationCheckInterval = $parsed }
-                    else { $config.OptimizationCheckInterval = 5 }
-                }
-                "FixAudio"      { $config.FixAudio = $val }
-                "RestartAudioService"  { $config.RestartAudioService = $val }
-                "RestartAudioEndpoint" { $config.RestartAudioEndpoint = $val }
-                "ApplyOptimizations"   { $config.ApplyOptimizations = $val }
-                "HighPerformancePower" { $config.HighPerformancePower = $val }
-                "GameMode"      { $config.GameMode = $val }
-                "DisableNagle"  { $config.DisableNagle = $val }
-                "TimerResolution" { $config.TimerResolution = $val }
-                "BackgroundServices" { $config.BackgroundServices = $val }
-                "NetworkThrottling" { $config.NetworkThrottling = $val }
-                "HardwareAccelGPU" { $config.HardwareAccelGPU = $val }
-                "DisableIndexing" { $config.DisableIndexing = $val }
-                "EnableLog"     { $config.EnableLog = $val }
-                "LogPath"       { $config.LogPath = $val }
-            }
-        }
-    }
-    return $config
-}
-
-function Set-ProcessPriorities {
-    param($Config)
-    $low  = $Config.LowPriority  | ForEach-Object { $_.ToLower() }
-    $high = $Config.HighPriority | ForEach-Object { $_.ToLower() }
+function Set-IniValue {
+    param([string]$Key, [string]$Value)
+    if (-not (Test-Path $ConfigPath)) { return }
     try {
-        $processes = Get-Process -ErrorAction SilentlyContinue
-        foreach ($p in $processes) {
-            $name = $p.ProcessName
-            $base = $name -replace '\.exe$', ''
-            $nameLower = $base.ToLower()
-            try {
-                $isLow = $false
-                foreach ($l in $low) {
-                    if ($nameLower -eq $l -or $nameLower -like "*$l*") { $isLow = $true; break }
-                }
-                if ($isLow) {
-                    if ($p.PriorityClass -ne "Idle" -and $p.PriorityClass -ne "BelowNormal") {
-                        $p.PriorityClass = "Idle"
-                        Write-Log "Low: $name"
-                    }
-                    continue
-                }
-                $isHigh = $false
-                foreach ($h in $high) {
-                    if ($nameLower -eq $h -or $nameLower -like "*$h*") { $isHigh = $true; break }
-                }
-                if ($isHigh) {
-                    if ($p.PriorityClass -ne "High" -and $p.PriorityClass -ne "RealTime") {
-                        $p.PriorityClass = "High"
-                        Write-Log "High: $name"
-                    }
-                }
-            } catch {}
+        $content = Get-Content $ConfigPath -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            Set-Content -Path $ConfigPath -Value "$Key=$Value" -Encoding UTF8
+            return
         }
-    } catch {}
+        $escaped = [regex]::Escape($Key)
+        $pattern = "(?mi)^(\s*$escaped\s*=).*$"
+        $safe = $Value.Replace('$', '$$')
+        if ($content -match $pattern) {
+            $content = $content -replace $pattern, ('$1' + $safe)
+            Set-Content -Path $ConfigPath -Value $content -Encoding UTF8 -NoNewline
+        }
+        else {
+            Add-Content -Path $ConfigPath -Value "$Key=$Value" -Encoding UTF8
+        }
+    }
+    catch { Write-Log "Set-IniValue error: $_" 'WARN' }
 }
 
-function Test-AudioWorking {
+function Add-ProcessToConfigList {
+    param([string]$Key, [string]$ProcessName)
+    if ([string]::IsNullOrWhiteSpace($ProcessName)) { return }
     try {
-        $srv = Get-Service -Name "Audiosrv" -ErrorAction Stop
-        if ($srv.Status -ne "Running") { 
-            Write-Log "Audio service Audiosrv is not running (Status: $($srv.Status))" "AUDIO"
-            return $false 
+        if (-not (Test-Path $ConfigPath)) {
+            Set-Content -Path $ConfigPath -Value "$Key=$ProcessName" -Encoding UTF8
+            return
         }
-        $endpoint = Get-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
-        if ($endpoint -and $endpoint.Status -ne "Running") { 
-            Write-Log "Audio service AudioEndpointBuilder is not running (Status: $($endpoint.Status))" "AUDIO"
-            return $false 
-        }
-        return $true
-    } catch { 
-        Write-Log "Audio check error: $_" "AUDIO"
-        return $false 
-    }
-}
-
-function Repair-Audio {
-    param($Config)
-    if ($Config.RestartAudioService -eq "1") {
-        try {
-            Write-Log "Attempting to restart audio services..." "AUDIO"
-            Stop-Service -Name "Audiosrv" -Force -ErrorAction SilentlyContinue
-            Stop-Service -Name "AudioEndpointBuilder" -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            Start-Service -Name "AudioEndpointBuilder" -ErrorAction Stop
-            Start-Sleep -Seconds 1
-            Start-Service -Name "Audiosrv" -ErrorAction Stop
-            Start-Sleep -Seconds 1
-            if (Test-AudioWorking) {
-                Write-Log "Audio services successfully restarted" "AUDIO"
-            } else {
-                Write-Log "Audio services restarted but still not working" "WARN"
+        $content = Get-Content $ConfigPath -Raw -Encoding UTF8
+        $escaped = [regex]::Escape($Key)
+        $m = [regex]::Match($content, "(?mi)^\s*$escaped\s*=(.*)$")
+        if ($m.Success) {
+            $items = @($m.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($items -notcontains $ProcessName) {
+                $items += $ProcessName
+                $newValue = ($items -join ',').Replace('$', '$$')
+                $content = $content -replace "(?mi)^(\s*$escaped\s*=).*$", ('$1' + $newValue)
+                Set-Content -Path $ConfigPath -Value $content -Encoding UTF8 -NoNewline
             }
-        } catch { 
-            Write-Log "Audio restart error: $_" "WARN"
+        }
+        else {
+            Add-Content -Path $ConfigPath -Value "$Key=$ProcessName" -Encoding UTF8
         }
     }
-    if ($Config.RestartAudioEndpoint -eq "1") {
-        try {
-            $devcon = Join-Path $ScriptDir "devcon.exe"
-            if (Test-Path $devcon) {
-                Write-Log "Attempting to restart audio endpoint via devcon..." "AUDIO"
-                & $devcon restart "AudioEndpointBuilder" 2>$null
-                Start-Sleep -Seconds 2
-            }
-        } catch {
-            Write-Log "Audio endpoint restart error: $_" "WARN"
-        }
-    }
+    catch { Write-Log "Add-ProcessToConfigList error: $_" 'WARN' }
 }
 
-function Get-PowerGuid {
-    $list = powercfg /list 2>$null
-    if (-not $list) { return "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c" }
-    $line = $list | Select-String "High performance|Vysokaya proizvoditelnost" | Select-Object -First 1
-    if (-not $line) { return "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c" }
-    $s = $line.Line
-    $parts = $s -split "\s+"
-    $hexClass = "[" + "0-9a-fA-F\-" + "]"
-    $guidRe = "^" + $hexClass + "{36}$"
-    foreach ($p in $parts) {
-        if ($p -match $guidRe) { return $p }
-    }
-    return "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
-}
-
-function Apply-WindowsOptimizations {
-    param($Config)
-    if ($Config.ApplyOptimizations -ne "1") { return }
+function Get-ForegroundProcessId {
     try {
-        if ($Config.HighPerformancePower -eq "1") {
-            $guid = Get-PowerGuid
-            powercfg /setactive $guid 2>$null
+        $hwnd = [User32Foreground]::GetForegroundWindow()
+        if ($hwnd -eq [IntPtr]::Zero) { return 0 }
+        $procId = 0
+        [void][User32Foreground]::GetWindowThreadProcessId($hwnd, [ref]$procId)
+        return [int]$procId
+    }
+    catch { return 0 }
+}
+
+function Test-NameMatch {
+    param([string]$Name, [array]$List)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    foreach ($item in $List) {
+        if ([string]::IsNullOrWhiteSpace($item)) { continue }
+        if ($Name -like $item.ToLower()) { return $true }
+    }
+    return $false
+}
+
+function Set-SafePriority {
+    param($Process, [string]$Class)
+    try {
+        if ($Process.PriorityClass -ne $Class) {
+            $Process.PriorityClass = $Class
+            return $true
         }
-        if ($Config.GameMode -eq "1") {
-            $path = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
-            if (Test-Path $path) {
-                Set-ItemProperty -Path $path -Name "GameDVR_Enabled" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-                Set-ItemProperty -Path $path -Name "GameDVR_FSEBehaviorMode" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
-            }
-            $path2 = "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR"
-            if (Test-Path $path2) { Set-ItemProperty -Path $path2 -Name "AppCaptureEnabled" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue }
+    }
+    catch {}
+    return $false
+}
+
+function Set-RegistryDword {
+    param([string]$Path, [string]$Name, [object]$Value, [bool]$Create = $true)
+    try {
+        if (-not (Test-Path $Path)) {
+            if ($Create) { New-Item -Path $Path -Force | Out-Null }
+            else { return }
         }
-        if ($Config.DisableNagle -eq "1") {
-            Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue | ForEach-Object {
-                try { Set-ItemProperty -Path $_.PSPath -Name "TcpAckFrequency" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue } catch {}
-                try { Set-ItemProperty -Path $_.PSPath -Name "TCPNoDelay" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue } catch {}
-            }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type DWord -Force | Out-Null
+    }
+    catch {}
+}
+
+function Set-RegistryString {
+    param([string]$Path, [string]$Name, [string]$Value, [bool]$Create = $false)
+    try {
+        if (-not (Test-Path $Path)) {
+            if ($Create) { New-Item -Path $Path -Force | Out-Null }
+            else { return }
         }
-        if ($Config.BackgroundServices -eq "0") {
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "NoLazyMode" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
-            $gamesPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
-            if (Test-Path $gamesPath) {
-                Set-ItemProperty -Path $gamesPath -Name "GPU Priority" -Value 8 -Type DWord -Force -ErrorAction SilentlyContinue
-                Set-ItemProperty -Path $gamesPath -Name "Priority" -Value 6 -Type DWord -Force -ErrorAction SilentlyContinue
-                Set-ItemProperty -Path $gamesPath -Name "Scheduling Category" -Value "High" -Type String -Force -ErrorAction SilentlyContinue
-            }
-        }
-        if ($Config.NetworkThrottling -eq "1") {
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "NetworkThrottlingIndex" -Value 0xffffffff -Type DWord -Force -ErrorAction SilentlyContinue
-        }
-        if ($Config.HardwareAccelGPU -eq "1") {
-            $gpuPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
-            if (Test-Path $gpuPath) {
-                Set-ItemProperty -Path $gpuPath -Name "HwSchMode" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
-            }
-        }
-    } catch {}
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type String -Force | Out-Null
+    }
+    catch {}
 }
 
 function Set-TimerResolution {
     try {
-        $tdef = "using System; using System.Runtime.InteropServices; public class NtTimer { [DllImport(`"ntdll.dll`")] public static extern int NtSetTimerResolution(uint r, bool s, out uint c); }"
-        $nt = Add-Type -TypeDefinition $tdef -PassThru -ErrorAction SilentlyContinue
-        if ($nt) {
-            $cur = [uint]0
-            $nt::NtSetTimerResolution([uint]5000, $true, [ref]$cur) | Out-Null
-        }
-    } catch {}
+        $current = [uint32]0
+        [void][NtTimer]::NtSetTimerResolution([uint32]5000, $true, [ref]$current)
+    }
+    catch {}
 }
 
-function Get-StartupShortcutPath {
-    $startup = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup)
-    Join-Path $startup "GameBoost.lnk"
+function Get-ActivePowerPlan {
+    try {
+        $out = & powercfg /getactivescheme 2>$null
+        if ($out -match '\((.+)\)') { return $matches[1] }
+        return 'неизвестно'
+    }
+    catch { return 'неизвестно' }
 }
+
+function Test-IsAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $pr = New-Object Security.Principal.WindowsPrincipal($id)
+        return $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch { return $false }
+}
+
+#endregion
+
+#region === КОНФИГ ===
+
+function Read-Config {
+    $cfg = @{
+        EnableLog = $false
+        LogPath = ''
+        LowPriority = @('Discord', 'DiscordPTB', 'DiscordCanary', 'chrome', 'msedge', 'brave', 'opera')
+        HighPriority = @('cs2', 'csgo', 'valorant', 'RocketLeague', 'dota2', 'FortniteClient-Win64', 'eldenring', 'GTA5', 'apex', 'rustclient', 'League of Legends', 'Wow', 'Wow-64', 'Destiny2', 'Warframe')
+        LowPriorityClass = 'BelowNormal'
+        HighPriorityClass = 'High'
+        ProcessCheckInterval = 3
+        OnlyForegroundGame = $false
+        TrimLowPriorityMemory = $true
+        HeroicMode = $true
+        HeroicLauncherPriority = 'BelowNormal'
+        HeroicSettingsBoost = $true
+        HeroicGameProcesses = @()
+        HotkeyEnabled = $true
+        ApplyOptimizations = $true
+        OptimizationCheckInterval = 10
+        PowerPlan = 'HighPerformance'
+        DisableGameDVR = $true
+        DisableFullscreenOptimizations = $true
+        DisablePowerThrottling = $true
+        NetworkThrottling = $true
+        DisableNagle = $true
+        TimerResolution = $true
+        GameTaskPriority = $true
+        HardwareGPU = $false
+    }
+
+    if (-not (Test-Path $ConfigPath)) { return $cfg }
+
+    foreach ($raw in (Get-Content $ConfigPath -Encoding UTF8)) {
+        $line = $raw.Trim()
+        if (-not $line) { continue }
+        if ($line.StartsWith(';')) { continue }
+        if ($line.StartsWith('#')) { continue }
+        if ($line.StartsWith('[')) { continue }
+
+        if ($line -match '^([^=]+)=(.*)$') {
+            $key = $matches[1].Trim()
+            $val = $matches[2].Trim()
+
+            switch ($key) {
+                'EnableLog'        { $cfg.EnableLog = ConvertTo-Bool $val }
+                'LogPath'          { if ($val) { $cfg.LogPath = $val } }
+                'LowPriority'      { $cfg.LowPriority = @($val -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+                'HighPriority'     { $cfg.HighPriority = @($val -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+                'LowPriorityClass' { if ($val -match '^(Idle|BelowNormal|Normal|AboveNormal|High)$') { $cfg.LowPriorityClass = $val } }
+                'HighPriorityClass'{ if ($val -match '^(Normal|AboveNormal|High)$') { $cfg.HighPriorityClass = $val } }
+                'ProcessCheckInterval' {
+                    $p = 0
+                    if ([int]::TryParse($val, [ref]$p) -and $p -ge 1) { $cfg.ProcessCheckInterval = $p }
+                }
+                'OnlyForegroundGame'    { $cfg.OnlyForegroundGame = ConvertTo-Bool $val }
+                'TrimLowPriorityMemory' { $cfg.TrimLowPriorityMemory = ConvertTo-Bool $val }
+                'HeroicMode'            { $cfg.HeroicMode = ConvertTo-Bool $val }
+                'HeroicLauncherPriority' { if ($val -match '^(Idle|BelowNormal|Normal|AboveNormal|High)$') { $cfg.HeroicLauncherPriority = $val } }
+                'HeroicSettingsBoost'   { $cfg.HeroicSettingsBoost = ConvertTo-Bool $val }
+                'HeroicGameProcesses'   { $cfg.HeroicGameProcesses = @($val -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+                'HotkeyEnabled'         { $cfg.HotkeyEnabled = ConvertTo-Bool $val }
+                'ApplyOptimizations'    { $cfg.ApplyOptimizations = ConvertTo-Bool $val }
+                'OptimizationCheckInterval' {
+                    $p = 0
+                    if ([int]::TryParse($val, [ref]$p) -and $p -ge 0) { $cfg.OptimizationCheckInterval = $p }
+                }
+                'PowerPlan'        { if ($val -match '^(HighPerformance|Ultimate|Balanced)$') { $cfg.PowerPlan = $val } }
+                'DisableGameDVR'   { $cfg.DisableGameDVR = ConvertTo-Bool $val }
+                'DisableFullscreenOptimizations' { $cfg.DisableFullscreenOptimizations = ConvertTo-Bool $val }
+                'DisablePowerThrottling' { $cfg.DisablePowerThrottling = ConvertTo-Bool $val }
+                'NetworkThrottling' { $cfg.NetworkThrottling = ConvertTo-Bool $val }
+                'DisableNagle'     { $cfg.DisableNagle = ConvertTo-Bool $val }
+                'TimerResolution'  { $cfg.TimerResolution = ConvertTo-Bool $val }
+                'GameTaskPriority' { $cfg.GameTaskPriority = ConvertTo-Bool $val }
+                'HardwareGPU'      { $cfg.HardwareGPU = ConvertTo-Bool $val }
+            }
+        }
+    }
+
+    if ($cfg.LogPath) { $script:LogPath = $cfg.LogPath }
+    else { $script:LogPath = Join-Path $ScriptDir 'GameBoost_log.txt' }
+
+    return $cfg
+}
+
+#endregion
+
+#region === HEROIC ===
+
+function Optimize-HeroicSettings {
+    param($Config)
+    if (-not $Config.HeroicSettingsBoost) { return }
+
+    $candidates = @(
+        (Join-Path $env:APPDATA 'heroic\config.json'),
+        (Join-Path $env:USERPROFILE '.config\heroic\config.json')
+    )
+
+    foreach ($path in $candidates) {
+        if (-not (Test-Path $path)) { continue }
+        try {
+            $obj = (Get-Content $path -Raw -Encoding UTF8) | ConvertFrom-Json
+            if (-not $obj) { continue }
+
+            $changed = $false
+            if ($obj.discordRPC -ne $false) {
+                Add-Member -InputObject $obj -Name 'discordRPC' -Value $false -MemberType NoteProperty -Force
+                $changed = $true
+            }
+            if ($obj.checkUpdatesEveryLaunch -ne $false) {
+                Add-Member -InputObject $obj -Name 'checkUpdatesEveryLaunch' -Value $false -MemberType NoteProperty -Force
+                $changed = $true
+            }
+            if ($obj.disableLogs -ne $true) {
+                Add-Member -InputObject $obj -Name 'disableLogs' -Value $true -MemberType NoteProperty -Force
+                $changed = $true
+            }
+
+            if ($changed) {
+                $bak = "$path.gameboost-backup"
+                if (-not (Test-Path $bak)) { Copy-Item $path $bak -Force }
+                ($obj | ConvertTo-Json -Depth 10) | Set-Content $path -Encoding UTF8
+                Write-Log "Heroic config optimized: $path"
+            }
+        }
+        catch { Write-Log "Heroic config patch error: $_" 'WARN' }
+    }
+}
+
+function Get-ProcessTree {
+    try {
+        return Get-CimInstance Win32_Process -Property Name, ProcessId, ParentProcessId, ExecutablePath -ErrorAction SilentlyContinue
+    }
+    catch { return $null }
+}
+
+function Test-IsHeroicChild {
+    param([int]$ProcId, [hashtable]$ParentOf, [hashtable]$HeroicPids)
+    $cur = $ProcId
+    for ($i = 0; $i -lt 10; $i++) {
+        if (-not $ParentOf.ContainsKey($cur)) { return $false }
+        $cur = $ParentOf[$cur]
+        if ($cur -eq 0) { return $false }
+        if ($HeroicPids.ContainsKey($cur)) { return $true }
+    }
+    return $false
+}
+
+#endregion
+
+#region === ОПТИМИЗАЦИИ WINDOWS ===
+
+function Apply-WindowsOptimizations {
+    param($Config, [switch]$Force)
+
+    if (-not $Config) { return }
+    if (-not $Config.ApplyOptimizations -and -not $Force) { return }
+
+    try {
+        $guid = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+        if ($Config.PowerPlan -eq 'Balanced') { $guid = '381b4222-f694-41f0-9685-ff5bb260df2e' }
+        if ($Config.PowerPlan -eq 'Ultimate') { $guid = 'e9a42b02-d5df-448d-aa00-03f14749eb61' }
+        $null = & powercfg /setactive $guid 2>$null
+    }
+    catch {}
+
+    if ($Config.DisableGameDVR) {
+        $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+        Set-RegistryDword $mm 'GameDVR_Enabled' 0 $false
+        Set-RegistryDword $mm 'GameDVR_FSEBehaviorMode' 2 $false
+        Set-RegistryDword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 $true
+        Set-RegistryDword 'HKCU:\Software\Microsoft\GameBar' 'UseNexusForGameBarEnabled' 0 $true
+        Set-RegistryDword 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0 $true
+    }
+
+    if ($Config.DisableFullscreenOptimizations) {
+        Set-RegistryDword 'HKCU:\System\GameConfigStore' 'GameDVR_FSEBehaviorMode' 2 $false
+        Set-RegistryDword 'HKCU:\System\GameConfigStore' 'GameDVR_FSEBehavior' 2 $false
+    }
+
+    if ($Config.DisablePowerThrottling) {
+        Set-RegistryDword 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' 'PowerThrottlingOff' 1 $true
+    }
+
+    if ($Config.NetworkThrottling) {
+        Set-RegistryDword 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' 'NetworkThrottlingIndex' ([uint32]::MaxValue) $false
+    }
+
+    if ($Config.DisableNagle) {
+        Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces' -ErrorAction SilentlyContinue | ForEach-Object {
+            Set-RegistryDword $_.PSPath 'TcpAckFrequency' 1 $false
+            Set-RegistryDword $_.PSPath 'TCPNoDelay' 1 $false
+        }
+    }
+
+    if ($Config.GameTaskPriority) {
+        $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+        Set-RegistryDword $mm 'SystemResponsiveness' 0 $false
+        $games = Join-Path $mm 'Tasks\Games'
+        Set-RegistryDword $games 'GPU Priority' 8 $true
+        Set-RegistryDword $games 'Priority' 6 $true
+        Set-RegistryString $games 'Scheduling Category' 'High' $true
+        Set-RegistryString $games 'SFIO Priority' 'High' $true
+    }
+
+    if ($Config.HardwareGPU) {
+        Set-RegistryDword 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2 $true
+    }
+
+    if ($Config.TimerResolution) { Set-TimerResolution }
+}
+
+#endregion
+
+#region === ПРИОРИТЕТЫ + RAM ===
+
+function Set-ProcessPriorities {
+    param($Config)
+
+    $low = @($Config.LowPriority)
+    $high = @($Config.HighPriority)
+    $heroicGames = @($Config.HeroicGameProcesses)
+
+    $heroicPids = @{}
+    $parentOf = @{}
+    if ($Config.HeroicMode) {
+        $tree = Get-ProcessTree
+        if ($tree) {
+            foreach ($w in $tree) {
+                $isHeroic = ($w.Name -match 'heroic|legendary') -or
+                            ($w.ExecutablePath -and ($w.ExecutablePath -match 'heroic|legendary'))
+                if ($isHeroic) { $heroicPids[[int]$w.ProcessId] = $true }
+                $parentOf[[int]$w.ProcessId] = [int]$w.ParentProcessId
+            }
+        }
+    }
+
+    $fgId = 0
+    if ($Config.OnlyForegroundGame) { $fgId = Get-ForegroundProcessId }
+
+    $protectedNames = @('idle','system','csrss','wininit','winlogon','services','lsass','smss','svchost','dwm','conhost','powershell','pwsh','cmd','gameboost')
+
+    $procs = Get-Process -ErrorAction SilentlyContinue
+    if (-not $procs) { return }
+
+    foreach ($p in $procs) {
+        try { if ($p.Id -eq $PID) { continue } } catch {}
+        try { $name = $p.ProcessName.ToLower() } catch { continue }
+        if ($protectedNames -contains $name) { continue }
+
+        if ($Config.HeroicMode -and (($name -match 'heroic|legendary') -or $heroicPids.ContainsKey($p.Id))) {
+            if ($name -match 'heroic|legendary') {
+                if (Set-SafePriority $p $Config.HeroicLauncherPriority) {
+                    Write-Log "Heroic launcher: $name -> $($Config.HeroicLauncherPriority)"
+                }
+            }
+            continue
+        }
+
+        if (Test-NameMatch $name $low) {
+            if (Set-SafePriority $p $Config.LowPriorityClass) {
+                Write-Log "Low: $name -> $($Config.LowPriorityClass)"
+            }
+            if ($Config.TrimLowPriorityMemory) {
+                try { [void][MemTrim]::Trim($p.Id) } catch {}
+            }
+            continue
+        }
+
+        $canHigh = $true
+        if ($Config.OnlyForegroundGame) { $canHigh = ($p.Id -eq $fgId) }
+        if (-not $canHigh) { continue }
+
+        if ($Config.HeroicMode -and (Test-IsHeroicChild $p.Id $parentOf $heroicPids)) {
+            if (Set-SafePriority $p $Config.HighPriorityClass) {
+                Write-Log "Heroic game (auto): $name -> $($Config.HighPriorityClass)"
+            }
+            continue
+        }
+
+        if ($Config.HeroicMode -and (Test-NameMatch $name $heroicGames)) {
+            if (Set-SafePriority $p $Config.HighPriorityClass) {
+                Write-Log "Heroic game: $name -> $($Config.HighPriorityClass)"
+            }
+            continue
+        }
+
+        if (Test-NameMatch $name $high) {
+            if (Set-SafePriority $p $Config.HighPriorityClass) {
+                Write-Log "High: $name -> $($Config.HighPriorityClass)"
+            }
+        }
+    }
+}
+
+#endregion
+
+#region === АВТОЗАПУСК ===
+
+function Get-TaskName { 'GameBoost' }
 
 function Test-StartupEnabled {
-    $path = Get-StartupShortcutPath
-    Test-Path $path
+    try {
+        $null = & schtasks /query /tn (Get-TaskName) 2>$null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch { return $false }
 }
 
 function Add-ToStartup {
     try {
-        $batPath = Join-Path $ScriptDir "GameBoost.bat"
-        $shortcutPath = Get-StartupShortcutPath
-        $shell = New-Object -ComObject WScript.Shell
-        $sc = $shell.CreateShortcut($shortcutPath)
-        
-        # Create PowerShell wrapper script that elevates
-        $wrapperScript = Join-Path $ScriptDir "GameBoost_Startup.ps1"
-        $wrapperContent = @"
-# GameBoost Startup Wrapper
-# This script runs GameBoost.bat with admin rights
-`$batPath = '$batPath'
-`$scriptDir = '$ScriptDir'
-Set-Location `$scriptDir
-Start-Process -FilePath `$batPath -Verb RunAs -WorkingDirectory `$scriptDir
-"@
-        [System.IO.File]::WriteAllText($wrapperScript, $wrapperContent, [System.Text.Encoding]::UTF8)
-        
-        # Create shortcut pointing to PowerShell wrapper
-        $sc.TargetPath = "powershell.exe"
-        $sc.Arguments = "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$wrapperScript`""
-        $sc.WorkingDirectory = $ScriptDir
-        $sc.Description = "GameBoost"
-        $sc.WindowStyle = 7
-        $sc.Save()
-        
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($shell) | Out-Null
-        Write-Log "Added to startup" "INFO"
-        return $true
-    } catch { 
-        Write-Log "Startup add error: $_" "WARN"
-        return $false 
+        $startupFolder = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup)
+        $oldLnk = Join-Path $startupFolder 'GameBoost Lite.lnk'
+        if (Test-Path $oldLnk) { Remove-Item $oldLnk -Force }
+        $oldLnk2 = Join-Path $startupFolder 'GameBoost.lnk'
+        if (Test-Path $oldLnk2) { Remove-Item $oldLnk2 -Force }
+        $oldWrap = Join-Path $ScriptDir 'GameBoost_Startup.ps1'
+        if (Test-Path $oldWrap) { Remove-Item $oldWrap -Force }
+
+        $ps1 = Join-Path $ScriptDir 'GameBoost.ps1'
+        $tr = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$ps1`" -Hidden"
+        $null = & schtasks /create /tn (Get-TaskName) /tr $tr /sc onlogon /rl highest /f 2>$null
+        Write-Log 'Startup: task created'
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        Write-Log "Startup add error: $_" 'WARN'
+        return $false
     }
 }
 
 function Remove-FromStartup {
     try {
-        $path = Get-StartupShortcutPath
-        if (Test-Path $path) { Remove-Item $path -Force }
-        $wrapperScript = Join-Path $ScriptDir "GameBoost_Startup.ps1"
-        if (Test-Path $wrapperScript) { Remove-Item $wrapperScript -Force -ErrorAction SilentlyContinue }
-        Write-Log "Removed from startup" "INFO"
+        $null = & schtasks /delete /tn (Get-TaskName) /f 2>$null
+        Write-Log 'Startup: task removed'
         return $true
-    } catch { 
-        Write-Log "Startup remove error: $_" "WARN"
-        return $false 
+    }
+    catch { return $false }
+}
+
+#endregion
+
+#region === КОНСОЛЬНОЕ ОКНО ===
+
+function Write-Con {
+    param([string]$Text, [string]$Color = 'White')
+    if (-not $script:Rtb) { return }
+    try {
+        $script:Rtb.SelectionStart = $script:Rtb.TextLength
+        $script:Rtb.SelectionLength = 0
+        try { $script:Rtb.SelectionColor = [System.Drawing.Color]::FromName($Color) }
+        catch { $script:Rtb.SelectionColor = [System.Drawing.Color]::White }
+        $script:Rtb.AppendText($Text + "`r`n")
+        $script:Rtb.SelectionColor = [System.Drawing.Color]::White
+        $script:Rtb.ScrollToCaret()
+    }
+    catch {}
+}
+
+function Clear-Con {
+    try { $script:Rtb.Clear() } catch {}
+}
+
+function Show-UiMessage {
+    param([string]$Message, [string]$Color = 'Green')
+    Write-Con "  $Message" $Color
+    Write-Log $Message
+}
+
+function Show-Balloon {
+    param([string]$Text)
+    if (-not $script:Tray) { return }
+    try {
+        $script:Tray.ShowBalloonTip(3000, 'GameBoost v1.1', $Text, [System.Windows.Forms.ToolTipIcon]::Info)
+    }
+    catch {}
+}
+
+function Hide-ConsoleWindow {
+    try { $script:Form.Hide() } catch {}
+    Show-Balloon 'GameBoost работает в трее. ПКМ по иконке - меню.'
+}
+
+function Show-ConsoleWindow {
+    try {
+        $script:Form.Show()
+        $script:Form.WindowState = 'Normal'
+        $script:Form.BringToFront()
+        Show-Menu
+        Invoke-SelfTest
+    }
+    catch {}
+}
+
+function Show-Status {
+    Write-Con '' 'Cyan'
+    Write-Con '  --- Статус ---' 'Cyan'
+
+    $state = if ($script:Paused) { 'пауза' } else { 'активен' }
+    $stateColor = if ($script:Paused) { 'Yellow' } else { 'Green' }
+    Write-Con "  Состояние: $state" $stateColor
+
+    $heroic = if ($script:Config.HeroicMode) { 'вкл' } else { 'выкл' }
+    Write-Con "  Heroic профиль: $heroic" 'Cyan'
+
+    $startup = if (Test-StartupEnabled) { 'вкл' } else { 'выкл' }
+    Write-Con "  Автозапуск: $startup" 'Cyan'
+
+    $hotkey = if ($script:Hotkey) { 'Ctrl+Alt+B' } else { 'выкл' }
+    Write-Con "  Горячая клавиша: $hotkey" 'Cyan'
+
+    $plan = Get-ActivePowerPlan
+    Write-Con "  Схема питания: $plan" 'Cyan'
+
+    $all = Get-Process -ErrorAction SilentlyContinue
+    $lowCount = 0
+    $highCount = 0
+    foreach ($pr in $all) {
+        $nm = $pr.ProcessName.ToLower()
+        if (Test-NameMatch $nm $script:Config.LowPriority) { $lowCount++ }
+        elseif (Test-NameMatch $nm $script:Config.HighPriority) { $highCount++ }
+    }
+    Write-Con "  Процессов с низким приоритетом: $lowCount" 'DarkGray'
+    Write-Con "  Процессов с высоким приоритетом: $highCount" 'DarkGray'
+    Write-Con ("  Низкий список: " + ($script:Config.LowPriority -join ', ')) 'DarkGray'
+    Write-Con ("  Высокий список: " + ($script:Config.HighPriority -join ', ')) 'DarkGray'
+    Write-Con '' 'White'
+}
+
+function Show-Menu {
+    Clear-Con
+
+    $pauseState = if ($script:Paused) { 'вкл' } else { 'выкл' }
+    $pauseColor = if ($script:Paused) { 'Yellow' } else { 'Green' }
+    $heroicState = if ($script:Config.HeroicMode) { 'вкл' } else { 'выкл' }
+    $heroicColor = if ($script:Config.HeroicMode) { 'Green' } else { 'Yellow' }
+    $startupState = if (Test-StartupEnabled) { 'вкл' } else { 'выкл' }
+    $startupColor = if (Test-StartupEnabled) { 'Green' } else { 'Yellow' }
+
+    Write-Con '  ==================================================' 'Cyan'
+    Write-Con '              GAMEBOOST v1.1 fix2' 'Green'
+    Write-Con '  ==================================================' 'Cyan'
+    Write-Con '' 'White'
+    Write-Con '  [1] Статус' 'White'
+    Write-Con '  [2] Применить оптимизации сейчас' 'White'
+    Write-Con "  [3] Пауза мониторинга: $pauseState" $pauseColor
+    Write-Con "  [4] Heroic профиль: $heroicState" $heroicColor
+    Write-Con '  [5] Захватить игру (отсчёт 5 сек)' 'White'
+    Write-Con '  [6] Добавить процесс в буст вручную' 'White'
+    Write-Con '  [7] Обновить конфиг' 'White'
+    Write-Con "  [8] Автозапуск: $startupState" $startupColor
+    Write-Con '  [9] Показать лог-файл' 'White'
+    Write-Con '  [0] Скрыть окно в трей' 'White'
+    Write-Con '  [Q] Полный выход' 'Red'
+    Write-Con '' 'White'
+    Write-Con '  Ctrl+Alt+B - добавить активную игру, не выходя из игры' 'DarkGray'
+    Write-Con '  Крестик окна = свернуть в трей. GameBoost продолжает работать!' 'DarkGray'
+    Write-Con '' 'White'
+}
+
+function Invoke-SelfTest {
+    Write-Con '  --- Самодиагностика ---' 'Cyan'
+
+    $admin = Test-IsAdmin
+    Write-Con ("  Права администратора: " + $(if ($admin) { '[OK]' } else { '[FAIL]' })) $(if ($admin) { 'Green' } else { 'Red' })
+
+    $formOk = [bool]$script:Form
+    Write-Con ("  Консольное окно: " + $(if ($formOk) { '[OK]' } else { '[FAIL]' })) $(if ($formOk) { 'Green' } else { 'Red' })
+
+    $trayOk = [bool]$script:Tray
+    Write-Con ("  Трей: " + $(if ($trayOk) { '[OK]' } else { '[FAIL]' })) $(if ($trayOk) { 'Green' } else { 'Red' })
+
+    $hotOk = [bool]$script:Hotkey
+    Write-Con ("  Горячая клавиша Ctrl+Alt+B: " + $(if ($hotOk) { '[OK]' } else { '[FAIL]' })) $(if ($hotOk) { 'Green' } else { 'Yellow' })
+
+    $cfgOk = [bool]$script:Config
+    Write-Con ("  Конфиг: " + $(if ($cfgOk) { '[OK]' } else { '[FAIL]' })) $(if ($cfgOk) { 'Green' } else { 'Red' })
+
+    $schOk = [bool](Get-Command schtasks -ErrorAction SilentlyContinue)
+    Write-Con ("  Планировщик заданий: " + $(if ($schOk) { '[OK]' } else { '[FAIL]' })) $(if ($schOk) { 'Green' } else { 'Red' })
+
+    Write-Con '' 'White'
+}
+
+function New-ConsoleForm {
+    $f = $null
+    try {
+        $f = New-Object System.Windows.Forms.Form
+        $f.Text = 'GameBoost v1.1'
+        $f.BackColor = [System.Drawing.Color]::Black
+        $f.Size = New-Object System.Drawing.Size(800, 500)
+        $f.StartPosition = 'CenterScreen'
+        $f.Font = New-Object System.Drawing.Font('Consolas', 10)
+        $f.KeyPreview = $true
+        $f.ShowInTaskbar = $true
+        $f.MinimumSize = New-Object System.Drawing.Size(500, 300)
+
+        $rtb = New-Object System.Windows.Forms.RichTextBox
+        $rtb.Dock = 'Fill'
+        $rtb.BackColor = [System.Drawing.Color]::Black
+        $rtb.ForeColor = [System.Drawing.Color]::White
+        $rtb.Font = New-Object System.Drawing.Font('Consolas', 10)
+        $rtb.ReadOnly = $true
+        $rtb.WordWrap = $true
+        $rtb.ScrollBars = 'Vertical'
+        $rtb.ShortcutsEnabled = $false
+        $rtb.BorderStyle = 'None'
+        $f.Controls.Add($rtb)
+
+        $f.Add_KeyDown({
+            param($s, $e)
+            try { Handle-Key ($e.KeyCode.ToString()) } catch { Write-Log "Key error: $_" 'WARN' }
+            $e.SuppressKeyPress = $true
+        })
+
+        $f.Add_FormClosing({
+            param($s, $e)
+            if (-not $script:AllowClose) {
+                $e.Cancel = $true
+                $script:Form.Hide()
+                Show-Balloon 'GameBoost всё ещё работает в трее.'
+            }
+        })
+
+        $script:Rtb = $rtb
+    }
+    catch {
+        Write-Log "Form creation error: $_" 'WARN'
+        $f = $null
+    }
+    return $f
+}
+
+#endregion
+
+#region === ЗАХВАТ ИГРЫ ===
+
+function Capture-ForegroundGame {
+    $fg = Get-ForegroundProcessId
+    if ($fg -eq 0 -or $fg -eq $PID) {
+        Show-Balloon 'Не удалось определить окно игры.'
+        return
+    }
+
+    $proc = Get-Process -Id $fg -ErrorAction SilentlyContinue
+    if (-not $proc) {
+        Show-Balloon 'Процесс уже закрыт.'
+        return
+    }
+
+    $name = $proc.ProcessName
+    $bad = @('explorer','powershell','pwsh','cmd','conhost','searchui','applicationframehost','shellexperiencehost','startmenuexperiencehost','textinputhost','taskmgr','heroic','legendary','gameboost')
+    if ($bad -contains $name.ToLower()) {
+        Show-Balloon "Окно '$name' - это не игра. Переключись в игру и попробуй снова."
+        return
+    }
+
+    if ($script:Config.HighPriority -contains $name) {
+        Show-Balloon "Игра '$name' уже в списке буста."
+        return
+    }
+
+    Add-ProcessToConfigList 'HighPriority' $name
+    $script:Config = Read-Config
+    Show-Balloon "Игра '$name' добавлена в буст (High)."
+    Show-UiMessage "Игра '$name' добавлена в HighPriority." 'Green'
+}
+
+function Start-DelayedCapture {
+    Show-UiMessage 'Переключись в игру! Захват через 5 секунд...' 'Yellow'
+    Show-Balloon 'Переключись в игру - захват через 5 секунд.'
+    for ($i = 5; $i -ge 1; $i--) {
+        Start-Sleep -Seconds 1
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    Capture-ForegroundGame
+}
+
+#endregion
+
+#region === ДЕЙСТВИЯ ===
+
+function Invoke-ActionApplyNow {
+    Apply-WindowsOptimizations $script:Config -Force
+    Show-UiMessage 'Оптимизации применены.' 'Green'
+}
+
+function Invoke-ActionTogglePause {
+    $script:Paused = -not $script:Paused
+    Update-State
+    Show-Menu
+    Invoke-SelfTest
+    if ($script:Paused) { Show-UiMessage 'Мониторинг приостановлен.' 'Yellow' }
+    else { Show-UiMessage 'Мониторинг возобновлён.' 'Green' }
+}
+
+function Invoke-ActionToggleHeroic {
+    $script:Config.HeroicMode = -not $script:Config.HeroicMode
+    Set-IniValue 'HeroicMode' $(if ($script:Config.HeroicMode) { '1' } else { '0' })
+    Update-State
+    Show-Menu
+    Invoke-SelfTest
+    $s = if ($script:Config.HeroicMode) { 'вкл' } else { 'выкл' }
+    Show-UiMessage "Heroic профиль: $s" 'Cyan'
+}
+
+function Invoke-ActionToggleStartup {
+    if (Test-StartupEnabled) { Remove-FromStartup | Out-Null }
+    else { Add-ToStartup | Out-Null }
+    Update-State
+    Show-Menu
+    Invoke-SelfTest
+    $s = if (Test-StartupEnabled) { 'вкл' } else { 'выкл' }
+    Show-UiMessage "Автозапуск: $s" 'Cyan'
+    Show-Balloon "Автозапуск: $s"
+}
+
+function Invoke-ActionRefreshConfig {
+    $script:Config = Read-Config
+    Update-State
+    Show-Menu
+    Invoke-SelfTest
+    Show-UiMessage 'Конфиг обновлён.' 'Cyan'
+}
+
+function Invoke-ActionShowLog {
+    if (Test-Path $script:LogPath) {
+        try { Invoke-Item $script:LogPath } catch {}
+    }
+    else {
+        Show-UiMessage 'Лог не найден. Включи EnableLog=1 в конфиге.' 'Yellow'
     }
 }
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$mutexName = "Global\GameBoost_SingleInstance"
-$mutex = New-Object System.Threading.Mutex($false, $mutexName)
-if (-not $mutex.WaitOne(0, $false)) {
-    [System.Windows.Forms.MessageBox]::Show("GameBoost is already running. Close it via tray icon (right-click -> Exit).", "GameBoost")
-    exit
+function Invoke-ActionManualAdd {
+    $manual = [Microsoft.VisualBasic.Interaction]::InputBox(
+        'Имя процесса без .exe (например: HellLetLooseClient):',
+        'GameBoost v1.1 - добавить в буст',
+        ''
+    )
+    if (-not [string]::IsNullOrWhiteSpace($manual)) {
+        $manual = $manual.Trim()
+        Add-ProcessToConfigList 'HighPriority' $manual
+        $script:Config = Read-Config
+        Show-UiMessage "Процесс '$manual' добавлен в HighPriority." 'Green'
+    }
+    else {
+        Show-UiMessage 'Отменено.' 'Yellow'
+    }
 }
 
-$script:ExitRequested = $false
-$script:Config = Read-Config
-if ($script:Config.LogPath) { $script:LogPath = $script:Config.LogPath }
+function Handle-Key {
+    param([string]$Key)
+    switch ($Key) {
+        'D1'      { Show-Status }
+        'NumPad1' { Show-Status }
+        'D2'      { Invoke-ActionApplyNow }
+        'NumPad2' { Invoke-ActionApplyNow }
+        'D3'      { Invoke-ActionTogglePause }
+        'NumPad3' { Invoke-ActionTogglePause }
+        'D4'      { Invoke-ActionToggleHeroic }
+        'NumPad4' { Invoke-ActionToggleHeroic }
+        'D5'      { Start-DelayedCapture }
+        'NumPad5' { Start-DelayedCapture }
+        'D6'      { Invoke-ActionManualAdd }
+        'NumPad6' { Invoke-ActionManualAdd }
+        'D7'      { Invoke-ActionRefreshConfig }
+        'NumPad7' { Invoke-ActionRefreshConfig }
+        'D8'      { Invoke-ActionToggleStartup }
+        'NumPad8' { Invoke-ActionToggleStartup }
+        'D9'      { Invoke-ActionShowLog }
+        'NumPad9' { Invoke-ActionShowLog }
+        'D0'      { Hide-ConsoleWindow }
+        'NumPad0' { Hide-ConsoleWindow }
+        'Escape'  { Hide-ConsoleWindow }
+        'Q'       { $script:ExitRequested = $true }
+    }
+}
 
-$form = New-Object System.Windows.Forms.Form
-$form.Visible = $false
-$form.ShowInTaskbar = $false
-$form.WindowState = "Minimized"
-$form.Load += { $form.WindowState = "Minimized"; $form.Hide() }
+#endregion
 
-$ni = New-Object System.Windows.Forms.NotifyIcon
-$ni.Icon = [System.Drawing.SystemIcons]::Application
-$ni.Text = "GameBoost - running"
-$ni.Visible = $true
+#region === ТРЕЙ (ЗАЩИЩЁННЫЙ) ===
 
-$menu = New-Object System.Windows.Forms.ContextMenuStrip
-$item1 = $menu.Items.Add("Pause monitoring", $null, {
-    $script:Paused = -not $script:Paused
-    if ($script:Paused) { $ni.Text = "GameBoost - paused" } else { $ni.Text = "GameBoost - running" }
-})
-$item2 = $menu.Items.Add("Apply optimizations now", $null, {
-    $script:Config = Read-Config
-    Apply-WindowsOptimizations $script:Config
-    Set-TimerResolution
-    [System.Windows.Forms.MessageBox]::Show("Optimizations applied.", "GameBoost")
-})
-$item3 = $menu.Items.Add("Restore audio", $null, {
-    $script:Config = Read-Config
-    Repair-Audio $script:Config
-    [System.Windows.Forms.MessageBox]::Show("Audio services restarted.", "GameBoost")
-})
-$item4 = $menu.Items.Add("Refresh config", $null, { $script:Config = Read-Config })
-$startupLabel = if (Test-StartupEnabled) { "Start with Windows: On" } else { "Start with Windows: Off" }
-$itemStartup = $menu.Items.Add($startupLabel, $null, {
-    if (Test-StartupEnabled) {
-        Remove-FromStartup | Out-Null
-        $itemStartup.Text = "Start with Windows: Off"
-        [System.Windows.Forms.MessageBox]::Show("Removed from startup. GameBoost will not run at logon.", "GameBoost")
-    } else {
-        if (Add-ToStartup) {
-            $itemStartup.Text = "Start with Windows: On"
-            [System.Windows.Forms.MessageBox]::Show("Added to startup. GameBoost will run when you log on (UAC prompt may appear).", "GameBoost")
-        } else {
-            [System.Windows.Forms.MessageBox]::Show("Failed to add to startup.", "GameBoost")
+function Update-State {
+    try {
+        if ($script:MenuPause) { $script:MenuPause.Checked = $script:Paused }
+        if ($script:MenuHeroic) { $script:MenuHeroic.Checked = [bool]$script:Config.HeroicMode }
+        if ($script:MenuStartup) {
+            $st = if (Test-StartupEnabled) { 'вкл' } else { 'выкл' }
+            $script:MenuStartup.Text = "Автозапуск: $st"
+        }
+        if ($script:Tray) {
+            if ($script:Paused) { $script:Tray.Text = 'GameBoost v1.1: пауза' }
+            else { $script:Tray.Text = 'GameBoost v1.1: активен' }
         }
     }
-})
-$item5 = $menu.Items.Add("Exit", $null, {
-    $script:ExitRequested = $true
-    $mutex.ReleaseMutex() | Out-Null
-    $mutex.Dispose()
-    $form.Close()
-})
-$ni.ContextMenuStrip = $menu
-
-$ni.DoubleClick += {
-    $script:Config = Read-Config
-    $msg = "GameBoost active. Paused: $($script:Paused). Low: $($script:Config.LowPriority -join ', '). High: $($script:Config.HighPriority -join ', ')"
-    [System.Windows.Forms.MessageBox]::Show($msg, "GameBoost")
+    catch { Write-Log "Update-State error: $_" 'WARN' }
 }
+
+function New-Tray {
+    $ni = $null
+    try { $ni = New-Object System.Windows.Forms.NotifyIcon } catch { $ni = $null }
+    if (-not $ni) {
+        Write-Log 'NotifyIcon creation failed - running without tray' 'WARN'
+        return $null
+    }
+
+    try {
+        $iconFile = Join-Path $ScriptDir 'GameBoost.ico'
+        if (Test-Path $iconFile) {
+            try { $ni.Icon = New-Object System.Drawing.Icon($iconFile) }
+            catch { $ni.Icon = [System.Drawing.SystemIcons]::Application }
+        }
+        else {
+            $ni.Icon = [System.Drawing.SystemIcons]::Application
+        }
+    }
+    catch {
+        try { $ni.Icon = [System.Drawing.SystemIcons]::Application } catch {}
+    }
+
+    $ni.Text = 'GameBoost v1.1: активен'
+    $ni.Visible = $true
+
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+
+    $miOpen = $menu.Items.Add('Открыть консоль')
+    $miOpen.Add_Click({
+        try { Show-ConsoleWindow } catch { Write-Log "Tray open error: $_" 'WARN' }
+    })
+
+    $script:MenuPause = $menu.Items.Add('Пауза мониторинга')
+    $script:MenuPause.CheckOnClick = $true
+    $script:MenuPause.Checked = $script:Paused
+    $script:MenuPause.Add_Click({
+        try {
+            $script:Paused = $script:MenuPause.Checked
+            Update-State
+            if ($script:Paused) { Show-UiMessage 'Мониторинг приостановлен.' 'Yellow' }
+            else { Show-UiMessage 'Мониторинг возобновлён.' 'Green' }
+        }
+        catch { Write-Log "Tray pause error: $_" 'WARN' }
+    })
+
+    $null = $menu.Items.Add('-')
+
+    $miApply = $menu.Items.Add('Применить оптимизации сейчас')
+    $miApply.Add_Click({
+        try {
+            Apply-WindowsOptimizations $script:Config -Force
+            Show-UiMessage 'Оптимизации применены.' 'Green'
+            Show-Balloon 'Оптимизации применены.'
+        }
+        catch { Write-Log "Tray apply error: $_" 'WARN' }
+    })
+
+    $miCapture = $menu.Items.Add('Захватить игру (5 сек)')
+    $miCapture.Add_Click({
+        try { Start-DelayedCapture } catch { Write-Log "Tray capture error: $_" 'WARN' }
+    })
+
+    $script:MenuHeroic = $menu.Items.Add('Heroic профиль')
+    $script:MenuHeroic.CheckOnClick = $true
+    $script:MenuHeroic.Checked = [bool]$script:Config.HeroicMode
+    $script:MenuHeroic.Add_Click({
+        try {
+            $script:Config.HeroicMode = $script:MenuHeroic.Checked
+            Set-IniValue 'HeroicMode' $(if ($script:Config.HeroicMode) { '1' } else { '0' })
+            Update-State
+            $s = if ($script:Config.HeroicMode) { 'вкл' } else { 'выкл' }
+            Show-UiMessage "Heroic профиль: $s" 'Cyan'
+        }
+        catch { Write-Log "Tray heroic error: $_" 'WARN' }
+    })
+
+    $script:MenuStartup = $menu.Items.Add('Автозапуск: выкл')
+    $script:MenuStartup.Add_Click({
+        try { Invoke-ActionToggleStartup } catch { Write-Log "Tray startup error: $_" 'WARN' }
+    })
+
+    $miRefresh = $menu.Items.Add('Обновить конфиг')
+    $miRefresh.Add_Click({
+        try {
+            $script:Config = Read-Config
+            Update-State
+            Show-UiMessage 'Конфиг перечитан.' 'Cyan'
+        }
+        catch { Write-Log "Tray refresh error: $_" 'WARN' }
+    })
+
+    $null = $menu.Items.Add('-')
+
+    $miExit = $menu.Items.Add('Выход')
+    $miExit.Add_Click({ $script:ExitRequested = $true })
+
+    $ni.ContextMenuStrip = $menu
+
+    # ВАЖНО: событие через add_DoubleClick + try/catch - падение трея больше не убивает запуск
+    try { $ni.add_DoubleClick({ try { Show-ConsoleWindow } catch {} }) } catch {}
+
+    return $ni
+}
+
+#endregion
+
+#region === СТАРТ ===
+
+$script:Config = Read-Config
+
+$script:Form = New-ConsoleForm
+
+if ($script:Config.HotkeyEnabled) {
+    try {
+        $script:Hotkey = New-Object GbHotkey
+        $script:Hotkey.Setup()
+    }
+    catch { $script:Hotkey = $null }
+}
+$lastHotkeyCount = 0
 
 Apply-WindowsOptimizations $script:Config
-if ($script:Config.TimerResolution -eq "1") { Set-TimerResolution }
+Optimize-HeroicSettings $script:Config
+Set-ProcessPriorities $script:Config
+$script:LastProcessCheck = Get-Date
+$script:LastOptCheck = Get-Date
 
-$script:LastProcessCheck = [datetime]::MinValue
-$script:LastAudioCheck   = [datetime]::MinValue
-$script:LastOptCheck     = [datetime]::MinValue
-$script:Paused           = $false
+$script:Tray = New-Tray
+Update-State
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 1000
-$timer.Add_Tick({
-    if ($script:ExitRequested) {
-        $timer.Stop()
-        $ni.Visible = $false
-        $form.Close()
-        return
-    }
-    if ($script:Paused) {
-        [System.Windows.Forms.Application]::DoEvents()
-        return
-    }
-    $script:Config = Read-Config
-    $now = Get-Date
-    if (($now - $script:LastProcessCheck).TotalSeconds -ge $script:Config.ProcessCheckInterval) {
-        $script:LastProcessCheck = $now
-        Set-ProcessPriorities $script:Config
-    }
-    if ($script:Config.FixAudio -eq "1" -and ($now - $script:LastAudioCheck).TotalSeconds -ge $script:Config.AudioCheckInterval) {
-        $script:LastAudioCheck = $now
+if (-not $Hidden) {
+    if ($script:Form) { $script:Form.Show() }
+    Show-Menu
+    Invoke-SelfTest
+}
+
+Show-Balloon 'GameBoost v1.1 fix2 запущен. Ctrl+Alt+B - добавить игру из игры.'
+
+#endregion
+
+#region === ГЛАВНЫЙ ЦИКЛ ===
+
+try {
+    while (-not $script:ExitRequested) {
         try {
-            if (-not (Test-AudioWorking)) {
-                Write-Log "Audio not working, attempting repair..." "AUDIO"
-                Repair-Audio $script:Config
+            if ($script:Hotkey -and ([GbHotkey]::HotkeyCount -gt $lastHotkeyCount)) {
+                $lastHotkeyCount = [GbHotkey]::HotkeyCount
+                Capture-ForegroundGame
             }
-        } catch {
-            Write-Log "Audio check/repair error in timer: $_" "WARN"
+
+            [System.Windows.Forms.Application]::DoEvents()
+
+            $now = Get-Date
+            if (-not $script:Paused) {
+                if (($now - $script:LastProcessCheck).TotalSeconds -ge $script:Config.ProcessCheckInterval) {
+                    $script:LastProcessCheck = $now
+                    Set-ProcessPriorities $script:Config
+                }
+                if ($script:Config.ApplyOptimizations -and
+                    $script:Config.OptimizationCheckInterval -gt 0 -and
+                    ($now - $script:LastOptCheck).TotalMinutes -ge $script:Config.OptimizationCheckInterval) {
+                    $script:LastOptCheck = $now
+                    Apply-WindowsOptimizations $script:Config
+                }
+            }
         }
-    }
-    if ($script:Config.ApplyOptimizations -eq "1" -and $script:Config.OptimizationCheckInterval -gt 0 -and ($now - $script:LastOptCheck).TotalMinutes -ge $script:Config.OptimizationCheckInterval) {
-        $script:LastOptCheck = $now
-        Apply-WindowsOptimizations $script:Config
-    }
-    [System.Windows.Forms.Application]::DoEvents()
-})
+        catch {
+            Write-Log "Loop error: $_" 'WARN'
+        }
 
-$timer.Start()
-
-$hideConsole = "[DllImport(`"user32.dll`")]`npublic static extern bool ShowWindow(IntPtr hwnd, int nCmdShow);"
-try {
-    $null = Add-Type -MemberDefinition $hideConsole -Name "Win32ShowWindow" -Namespace "Native" -PassThru -ErrorAction SilentlyContinue
-    $hwnd = (Get-Process -Id $pid).MainWindowHandle
-    if ($hwnd -ne [IntPtr]::Zero) {
-        [Native.Win32ShowWindow]::ShowWindow($hwnd, 0)
+        Start-Sleep -Milliseconds 120
     }
-} catch {}
-
-try {
-    [void][System.Windows.Forms.Application]::Run($form)
-} finally {
-    try { $mutex.ReleaseMutex() | Out-Null } catch {}
+}
+finally {
+    try {
+        $script:AllowClose = $true
+        if ($script:Form) { $script:Form.Close(); $script:Form.Dispose() }
+    }
+    catch {}
+    if ($script:Tray) {
+        try { $script:Tray.Visible = $false; $script:Tray.Dispose() } catch {}
+    }
+    try { $mutex.ReleaseMutex() } catch {}
     try { $mutex.Dispose() } catch {}
 }
-$ni.Dispose()
+
+#endregion
