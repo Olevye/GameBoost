@@ -1,10 +1,11 @@
 ﻿#Requires -RunAsAdministrator
 <#
-    GameBoost v1.1 fix2
+    GameBoost v1.2 - Gamepad Edition
     - Своё консольное окно (крестик = в трей)
     - Самодиагностика при старте
     - Трей не может уронить запуск
     - Heroic авто-буст, Ctrl+Alt+B, автозапуск через планировщик
+    - ГЕЙМПАД: мёртвые зоны (Circular/Square/Cross), визуализация стиков
     - БЕЗ авто-починки звука
 #>
 
@@ -38,7 +39,7 @@ $script:MenuStartup      = $null
 $script:LastProcessCheck = [datetime]::MinValue
 $script:LastOptCheck     = [datetime]::MinValue
 
-$mutex = New-Object System.Threading.Mutex($false, 'Global\GameBoost_v11fix2')
+$mutex = New-Object System.Threading.Mutex($false, 'Global\GameBoost_v12')
 if (-not $mutex.WaitOne(0, $false)) {
     [System.Windows.Forms.MessageBox]::Show(
         'GameBoost уже запущен. Закрой его через трей: ПКМ -> Выход.',
@@ -718,7 +719,7 @@ function Show-Menu {
     $startupColor = if (Test-StartupEnabled) { 'Green' } else { 'Yellow' }
 
     Write-Con '  ==================================================' 'Cyan'
-    Write-Con '              GAMEBOOST v1.1 fix2' 'Green'
+    Write-Con '           GAMEBOOST v1.2 - Gamepad Edition' 'Green'
     Write-Con '  ==================================================' 'Cyan'
     Write-Con '' 'White'
     Write-Con '  [1] Статус' 'White'
@@ -731,6 +732,8 @@ function Show-Menu {
     Write-Con "  [8] Автозапуск: $startupState" $startupColor
     Write-Con '  [9] Показать лог-файл' 'White'
     Write-Con '  [0] Скрыть окно в трей' 'White'
+    Write-Con '  [G] Настройки геймпада (мёртвые зоны)' 'Yellow'
+    Write-Con '  [C] Калибровка под активную игру' 'Yellow'
     Write-Con '  [Q] Полный выход' 'Red'
     Write-Con '' 'White'
     Write-Con '  Ctrl+Alt+B - добавить активную игру, не выходя из игры' 'DarkGray'
@@ -948,6 +951,209 @@ function Handle-Key {
         'NumPad7' { Invoke-ActionRefreshConfig }
         'D8'      { Invoke-ActionToggleStartup }
         'NumPad8' { Invoke-ActionToggleStartup }
+        'G'       { Show-GamepadMenu }
+        'C'       { Start-GamepadCalibration }
+        'Escape'  { Hide-ConsoleWindow }
+        'Q'       { $script:ExitRequested = $true }
+    }
+}
+
+# === GAMEPAD MANAGER - ВСТРАИВАЕМЫЙ МОДУЛЬ ===
+
+# Глобальные переменные геймпада
+$script:LeftDeadzone = 0.15
+$script:RightDeadzone = 0.15
+$script:LeftShape = 'Circular'
+$script:RightShape = 'Circular'
+$script:LeftSensitivity = 1.0
+$script:RightSensitivity = 1.0
+$script:ActiveGamePid = 0
+$script:GamepadMenuKey = $null
+
+# C# классы для XInput и Deadzone (добавляем если ещё не загружены)
+try {
+    if (-not ('XInputState' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public struct XInputState { public uint dwPacketNumber; public XInputGamepad Gamepad; }
+public struct XInputGamepad { public ushort wButtons; public byte bLeftTrigger; public byte bRightTrigger; public short sThumbLX; public short sThumbLY; public short sThumbRX; public short sThumbRY; }
+public enum XInputError : uint { Success = 0, DeviceNotConnected = 1167 }
+public class XInputNative {
+    [DllImport("xinput1_4.dll")] public static extern XInputError XInputGetState(uint dwUserIndex, out XInputState pState);
+    [DllImport("xinput1_3.dll")] public static extern XInputError XInputGetStateEx(uint dwUserIndex, out XInputState pState);
+}
+public enum DeadzoneShape { Circular, Square, Cross }
+public class DeadzoneProcessor {
+    public static void ProcessAxis(short rawX, short rawY, double innerDz, double sensitivity, DeadzoneShape shape, out short outX, out short outY) {
+        float nx = rawX / 32768.0f, ny = rawY / 32768.0f, px, py;
+        switch (shape) {
+            case DeadzoneShape.Square: ProcessSquare(nx, ny, innerDz, sensitivity, out px, out py); break;
+            case DeadzoneShape.Cross: ProcessCross(nx, ny, innerDz, sensitivity, out px, out py); break;
+            default: ProcessCircular(nx, ny, innerDz, sensitivity, out px, out py); break;
+        }
+        outX = (short)(Math.Max(-1.0, Math.Min(1.0, px)) * 32767);
+        outY = (short)(Math.Max(-1.0, Math.Min(1.0, py)) * 32767);
+    }
+    private static void ProcessCircular(float x, float y, double dz, double sens, out float ox, out float oy) {
+        float mag = (float)Math.Sqrt(x * x + y * y);
+        if (mag <= dz) { ox = 0; oy = 0; return; }
+        float angle = (float)Math.Atan2(y, x), norm = (mag - dz) / (1.0 - dz);
+        norm = (float)Math.Pow(norm, 1.0 / sens);
+        ox = (float)(Math.Cos(angle) * norm); oy = (float)(Math.Sin(angle) * norm);
+    }
+    private static void ProcessSquare(float x, float y, double dz, double sens, out float ox, out float oy) {
+        float ax = Math.Abs(x), ay = Math.Abs(y);
+        ax = ax <= dz ? 0 : (ax - dz) / (1.0 - dz); ay = ay <= dz ? 0 : (ay - dz) / (1.0 - dz);
+        ax = (float)Math.Pow(ax, 1.0 / sens); ay = (float)Math.Pow(ay, 1.0 / sens);
+        ox = Math.Sign(x) * ax; oy = Math.Sign(y) * ay;
+    }
+    private static void ProcessCross(float x, float y, double dz, double sens, out float ox, out float oy) {
+        float ax = Math.Abs(x), ay = Math.Abs(y);
+        float effDz = (ax > dz && ay > dz) ? dz * 1.3f : dz;
+        float factor = (ax > 0.1f && ay > 0.1f) ? 1.0f - (Math.Min(ax, ay) / Math.Max(ax, ay)) * 0.5f : 1.0f;
+        ax = ax <= effDz ? 0 : (ax - effDz) / (1.0 - effDz) * factor;
+        ay = ay <= effDz ? 0 : (ay - effDz) / (1.0 - effDz) * factor;
+        ax = (float)Math.Pow(ax, 1.0 / sens); ay = (float)Math.Pow(ay, 1.0 / sens);
+        ox = Math.Sign(x) * ax; oy = Math.Sign(y) * ay;
+    }
+}
+'@
+    }
+} catch {}
+
+function Get-XInputState {
+    param([uint]$PlayerIndex = 0)
+    $state = New-Object XInputState
+    $result = [XInputNative]::XInputGetState($PlayerIndex, [ref]$state)
+    if ($result -eq [XInputError]::Success) {
+        return @{ Connected = $true; PacketNumber = $state.dwPacketNumber; Buttons = $state.Gamepad.wButtons
+                  LeftTrigger = $state.Gamepad.bLeftTrigger; RightTrigger = $state.Gamepad.bRightTrigger
+                  LeftX = $state.Gamepad.sThumbLX; LeftY = $state.Gamepad.sThumbLY
+                  RightX = $state.Gamepad.sThumbRX; RightY = $state.Gamepad.sThumbRY }
+    } else { return @{ Connected = $false } }
+}
+
+function Format-StickVisual {
+    param([short]$x, [short]$y, [int]$width = 15, [int]$height = 5)
+    $centerX = [math]::Floor($width / 2); $centerY = [math]::Floor($height / 2)
+    $displayX = $centerX + [math]::Round(($x / 32768.0) * ($centerX - 1))
+    $displayY = $centerY - [math]::Round(($y / 32768.0) * ($centerY - 1))
+    $displayX = [math]::Max(0, [math]::Min($width - 1, $displayX)); $displayY = [math]::Max(0, [math]::Min($height - 1, $displayY))
+    $grid = @()
+    for ($row = 0; $row -lt $height; $row++) {
+        $line = ""
+        for ($col = 0; $col -lt $width; $col++) {
+            if ($row -eq $centerY -and $col -eq $centerX) { $line += "+" }
+            elseif ($row -eq $displayY -and $col -eq $displayX) { $line += "O" }
+            elseif ($row -eq $centerY) { $line += "-" }
+            elseif ($col -eq $centerX) { $line += "|" }
+            else { $line += "." }
+        }
+        $grid += $line
+    }
+    return $grid
+}
+
+function Save-GamepadConfig {
+    $configPath = Join-Path $ScriptDir 'GameBoost_Gamepad.json'
+    @{ LeftDeadzone = $script:LeftDeadzone; RightDeadzone = $script:RightDeadzone
+       LeftShape = $script:LeftShape; RightShape = $script:RightShape
+       LeftSensitivity = $script:LeftSensitivity; RightSensitivity = $script:RightSensitivity } | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
+}
+
+function Load-GamepadConfig {
+    $configPath = Join-Path $ScriptDir 'GameBoost_Gamepad.json'
+    if (Test-Path $configPath) {
+        $cfg = Get-Content -Path $configPath -Encoding UTF8 | ConvertFrom-Json
+        if ($cfg.LeftDeadzone) { $script:LeftDeadzone = $cfg.LeftDeadzone }
+        if ($cfg.RightDeadzone) { $script:RightDeadzone = $cfg.RightDeadzone }
+        if ($cfg.LeftShape) { $script:LeftShape = $cfg.LeftShape }
+        if ($cfg.RightShape) { $script:RightShape = $cfg.RightShape }
+    }
+}
+
+function Show-GamepadMenu {
+    Load-GamepadConfig
+    $selected = 0
+    $items = @("Левый стик - Мёртвая зона: $($script:LeftDeadzone.ToString("F2"))",
+               "Левый стик - Форма: $($script:LeftShape)",
+               "Правый стик - Мёртвая зона: $($script:RightDeadzone.ToString("F2"))",
+               "Правый стик - Форма: $($script:RightShape)",
+               "Сохранить и выйти")
+    $lastUpdate = [datetime]::Now
+    while ($true) {
+        Clear-Con
+        Write-Con "╔═══════════════════════════════════════╗" "Cyan"
+        Write-Con "║   НАСТРОЙКИ ГЕЙМПАДА                ║" "Cyan"
+        Write-Con "╚═══════════════════════════════════════╝" "Cyan"
+        Write-Con ""; Write-Con "  ↑/↓ Выбор  ←/→ Значение  Enter Применить  ESC Выход" "Gray"; Write-Con ""
+        for ($i = 0; $i -lt $items.Length; $i++) {
+            if ($i -eq $selected) { Write-Con "  ► $($items[$i])" "Yellow" } else { Write-Con "    $($items[$i])" "White" }
+        }
+        Write-Con ""
+        if (([datetime]::Now - $lastUpdate).TotalMilliseconds -ge 100) {
+            $lastUpdate = [datetime]::Now
+            $gp = Get-XInputState -PlayerIndex 0
+            if ($gp.Connected) {
+                Write-Con "  ┌───── ВИЗУАЛИЗАЦИЯ ─────┐" "Green"
+                $lg = Format-StickVisual -x $gp.LeftX -y $gp.LeftY
+                Write-Con "  LS: $($lg[0])" "White"; Write-Con "      $($lg[1])" "White"
+                Write-Con "      $($lg[2])" "White"; Write-Con "      $($lg[3])" "White"
+                Write-Con "      $($lg[4])" "White"
+                $rg = Format-StickVisual -x $gp.RightX -y $gp.RightY
+                Write-Con "  RS: $($rg[0])" "White"; Write-Con "      $($rg[1])" "White"
+                Write-Con "      $($rg[2])" "White"; Write-Con "      $($rg[3])" "White"
+                Write-Con "      $($rg[4])" "White"
+                Write-Con "  └────────────────────────┘" "Green"
+            } else { Write-Con "  [!] Геймпад не подключён" "Red" }
+        }
+        [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50
+        if ($script:GamepadMenuKey -eq 'Escape') { $script:GamepadMenuKey = $null; break }
+        elseif ($script:GamepadMenuKey -eq 'Up') { $script:GamepadMenuKey = $null; $selected = [math]::Max(0, $selected - 1) }
+        elseif ($script:GamepadMenuKey -eq 'Down') { $script:GamepadMenuKey = $null; $selected = [math]::Min($items.Length - 1, $selected + 1) }
+        elseif ($script:GamepadMenuKey -eq 'Left') {
+            $script:GamepadMenuKey = $null
+            if ($selected -eq 0) { $script:LeftDeadzone = [math]::Max(0.0, [math]::Round($script:LeftDeadzone - 0.01, 2)) }
+            if ($selected -eq 2) { $script:RightDeadzone = [math]::Max(0.0, [math]::Round($script:RightDeadzone - 0.01, 2)) }
+            $items = @("Левый стик - Мёртвая зона: $($script:LeftDeadzone.ToString("F2"))", "Левый стик - Форма: $($script:LeftShape)",
+                       "Правый стик - Мёртвая зона: $($script:RightDeadzone.ToString("F2"))", "Правый стик - Форма: $($script:RightShape)", "Сохранить и выйти")
+        }
+        elseif ($script:GamepadMenuKey -eq 'Right') {
+            $script:GamepadMenuKey = $null
+            if ($selected -eq 0) { $script:LeftDeadzone = [math]::Min(1.0, [math]::Round($script:LeftDeadzone + 0.01, 2)) }
+            if ($selected -eq 2) { $script:RightDeadzone = [math]::Min(1.0, [math]::Round($script:RightDeadzone + 0.01, 2)) }
+            $items = @("Левый стик - Мёртвая зона: $($script:LeftDeadzone.ToString("F2"))", "Левый стик - Форма: $($script:LeftShape)",
+                       "Правый стик - Мёртвая зона: $($script:RightDeadzone.ToString("F2"))", "Правый стик - Форма: $($script:RightShape)", "Сохранить и выйти")
+        }
+        elseif ($script:GamepadMenuKey -eq 'Enter') {
+            $script:GamepadMenuKey = $null
+            if ($selected -eq 1) {
+                switch ($script:LeftShape) { 'Circular' { $script:LeftShape = 'Square' }; 'Square' { $script:LeftShape = 'Cross' }; 'Cross' { $script:LeftShape = 'Circular' } }
+                $items = @("Левый стик - Мёртвая зона: $($script:LeftDeadzone.ToString("F2"))", "Левый стик - Форма: $($script:LeftShape)",
+                           "Правый стик - Мёртвая зона: $($script:RightDeadzone.ToString("F2"))", "Правый стик - Форма: $($script:RightShape)", "Сохранить и выйти")
+            }
+            if ($selected -eq 3) {
+                switch ($script:RightShape) { 'Circular' { $script:RightShape = 'Square' }; 'Square' { $script:RightShape = 'Cross' }; 'Cross' { $script:RightShape = 'Circular' } }
+                $items = @("Левый стик - Мёртвая зона: $($script:LeftDeadzone.ToString("F2"))", "Левый стик - Форма: $($script:LeftShape)",
+                           "Правый стик - Мёртвая зона: $($script:RightDeadzone.ToString("F2"))", "Правый стик - Форма: $($script:RightShape)", "Сохранить и выйти")
+            }
+            if ($selected -eq 4) { Save-GamepadConfig; Show-UiMessage "Настройки геймпада сохранены!" "Green"; break }
+        }
+    }
+}
+
+function Start-GamepadCalibration {
+    Show-UiMessage "КАЛИБРОВКА ПОД ИГРУ (5 сек)" "Yellow"; Show-Balloon "Переключись в игру..."
+    for ($i = 5; $i -ge 1; $i--) { Clear-Con; Write-Con "  Переключись в игру... $i" "Yellow"; Start-Sleep -Seconds 1; [System.Windows.Forms.Application]::DoEvents() }
+    $fg = Get-ForegroundProcessId
+    if ($fg -gt 0) { $script:ActiveGamePid = $fg; $proc = Get-Process -Id $fg -ErrorAction SilentlyContinue
+        if ($proc) { Show-UiMessage "Игра: $($proc.ProcessName)" "Green"; Show-Balloon "Применено для: $($proc.ProcessName)" } }
+}
+        'D7'      { Invoke-ActionRefreshConfig }
+        'NumPad7' { Invoke-ActionRefreshConfig }
+        'D8'      { Invoke-ActionToggleStartup }
+        'NumPad8' { Invoke-ActionToggleStartup }
         'D9'      { Invoke-ActionShowLog }
         'NumPad9' { Invoke-ActionShowLog }
         'D0'      { Hide-ConsoleWindow }
@@ -1113,7 +1319,7 @@ if (-not $Hidden) {
     Invoke-SelfTest
 }
 
-Show-Balloon 'GameBoost v1.1 fix2 запущен. Ctrl+Alt+B - добавить игру из игры.'
+Show-Balloon 'GameBoost v1.2 запущен. G - настройки геймпада, C - калибровка.'
 
 #endregion
 
