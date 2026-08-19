@@ -934,6 +934,14 @@ function Invoke-ActionManualAdd {
 
 function Handle-Key {
     param([string]$Key)
+    
+    # Если открыто меню геймпада - обрабатываем там
+    if ($script:InGamepadMenu) {
+        $script:GamepadMenuKey = $Key
+        return
+    }
+    
+    # Главное меню - только цифры и буквы
     switch ($Key) {
         'D1'      { Show-Status }
         'NumPad1' { Show-Status }
@@ -951,6 +959,10 @@ function Handle-Key {
         'NumPad7' { Invoke-ActionRefreshConfig }
         'D8'      { Invoke-ActionToggleStartup }
         'NumPad8' { Invoke-ActionToggleStartup }
+        'D9'      { Invoke-ActionShowLog }
+        'NumPad9' { Invoke-ActionShowLog }
+        'D0'      { Hide-ConsoleWindow }
+        'NumPad0' { Hide-ConsoleWindow }
         'G'       { Show-GamepadMenu }
         'C'       { Start-GamepadCalibration }
         'Escape'  { Hide-ConsoleWindow }
@@ -969,6 +981,7 @@ $script:LeftSensitivity = 1.0
 $script:RightSensitivity = 1.0
 $script:ActiveGamePid = 0
 $script:GamepadMenuKey = $null
+$script:InGamepadMenu = $false
 
 # C# классы для XInput и Deadzone (добавляем если ещё не загружены)
 try {
@@ -1074,6 +1087,7 @@ function Load-GamepadConfig {
 }
 
 function Show-GamepadMenu {
+    $script:InGamepadMenu = $true
     Load-GamepadConfig
     $selected = 0
     $items = @("Левый стик - Мёртвая зона: $($script:LeftDeadzone.ToString("F2"))",
@@ -1141,6 +1155,9 @@ function Show-GamepadMenu {
             if ($selected -eq 4) { Save-GamepadConfig; Show-UiMessage "Настройки геймпада сохранены!" "Green"; break }
         }
     }
+    $script:InGamepadMenu = $false
+    $script:GamepadMenuKey = $null
+    Show-Menu
 }
 
 function Start-GamepadCalibration {
@@ -1149,18 +1166,6 @@ function Start-GamepadCalibration {
     $fg = Get-ForegroundProcessId
     if ($fg -gt 0) { $script:ActiveGamePid = $fg; $proc = Get-Process -Id $fg -ErrorAction SilentlyContinue
         if ($proc) { Show-UiMessage "Игра: $($proc.ProcessName)" "Green"; Show-Balloon "Применено для: $($proc.ProcessName)" } }
-}
-        'D7'      { Invoke-ActionRefreshConfig }
-        'NumPad7' { Invoke-ActionRefreshConfig }
-        'D8'      { Invoke-ActionToggleStartup }
-        'NumPad8' { Invoke-ActionToggleStartup }
-        'D9'      { Invoke-ActionShowLog }
-        'NumPad9' { Invoke-ActionShowLog }
-        'D0'      { Hide-ConsoleWindow }
-        'NumPad0' { Hide-ConsoleWindow }
-        'Escape'  { Hide-ConsoleWindow }
-        'Q'       { $script:ExitRequested = $true }
-    }
 }
 
 #endregion
