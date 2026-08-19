@@ -1,1 +1,1 @@
-Nothing needs to be added to the .gitignore file based on the provided file changes. The modification of 'GameBoost.ps1' does not require any new ignore rules, as PowerShell scripts are typically source files that should be tracked in version control. No build artifacts, dependency directories, or temporary files were detected in the changes that would warrant adding ignore patterns.
+Nothing needs to be added to .gitignore since only a PowerShell script file (GameBoost.ps1) was modified, which is a source code file that should not be ignored.
